@@ -215,10 +215,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         out.append(f"  Size       : {hsize(map_bytes)}")
         out.append(f"  Mappings   : {len(redactor.map)}")
         out.append("")
-        out.append("Span cache (detected PII per chunk)")
+        out.append("Span cache (detected PII per chunk — append-only, unbounded)")
         out.append(f"  Path       : {SPAN_CACHE_PATH}")
         out.append(f"  Size       : {hsize(cache_bytes)}")
-        out.append(f"  In memory  : {len(redactor._span_cache)} entries / cap {redactor._cache_size}")
+        out.append(f"  In memory  : {len(redactor._span_cache)} entries")
         out.append("")
         out.append("HMAC secret")
         out.append(f"  Path       : {SECRET_PATH}")
@@ -230,24 +230,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_text(200, "\n".join(out) + "\n")
 
     def _handle_admin_cache_clear(self):
-        from redactor import SPAN_CACHE_PATH
-        # Read body for JSON option {"keep_tokens": bool} (default true)
-        try:
-            body = self._read_body()
-            opts = json.loads(body) if body else {}
-        except Exception:
-            opts = {}
+        from redactor import SPAN_CACHE_PATH, SPAN_CACHE_LEGACY_JSON_PATH
         with redactor._span_cache_lock:
             removed_in_mem = len(redactor._span_cache)
             redactor._span_cache.clear()
-            redactor._span_cache_dirty = True
         on_disk_bytes = 0
-        if os.path.exists(SPAN_CACHE_PATH):
-            on_disk_bytes = os.path.getsize(SPAN_CACHE_PATH)
-            try:
-                os.remove(SPAN_CACHE_PATH)
-            except Exception as e:
-                log.warning(f"[ADMIN] could not remove span cache: {e}")
+        for p in (SPAN_CACHE_PATH, SPAN_CACHE_LEGACY_JSON_PATH, SPAN_CACHE_LEGACY_JSON_PATH + ".bak"):
+            if os.path.exists(p):
+                on_disk_bytes += os.path.getsize(p)
+                try:
+                    os.remove(p)
+                except Exception as e:
+                    log.warning(f"[ADMIN] could not remove {p}: {e}")
         msg = (
             f"Span cache cleared.\n"
             f"  In-memory entries dropped : {removed_in_mem}\n"
@@ -352,13 +346,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 conn.close()
             except Exception:
                 pass
-            # Persist any new span-cache entries from this request so they
-            # survive proxy restarts. Cheap atomic write; a no-op if nothing
-            # was added.
-            try:
-                redactor.save_span_cache()
-            except Exception as e:
-                log.warning(f"[CACHE] save failed: {e}")
+            # New span cache entries were already appended inline during
+            # detection; nothing left to do here.
 
     def _forward_full(self, resp):
         body = resp.read()
