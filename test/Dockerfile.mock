@@ -1,0 +1,5 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY test/mock_anthropic.py .
+EXPOSE 9212
+CMD ["python", "mock_anthropic.py", "9212"]

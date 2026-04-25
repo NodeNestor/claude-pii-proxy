@@ -1,0 +1,36 @@
+services:
+  mock-anthropic:
+    build:
+      context: .
+      dockerfile: test/Dockerfile.mock
+    networks:
+      - test-net
+
+  pii-proxy:
+    build: .
+    environment:
+      - PII_PROXY_PORT=5599
+      - PII_PROXY_UPSTREAM=http://mock-anthropic:9212
+      - PII_PROXY_MIN_SCORE=0.5
+      - PII_PROXY_WARMUP=1
+    depends_on:
+      - mock-anthropic
+    networks:
+      - test-net
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: test/Dockerfile.test
+    environment:
+      - PROXY_URL=http://pii-proxy:5599
+      - MOCK_URL=http://mock-anthropic:9212
+    depends_on:
+      - pii-proxy
+      - mock-anthropic
+    networks:
+      - test-net
+
+networks:
+  test-net:
+    driver: bridge
