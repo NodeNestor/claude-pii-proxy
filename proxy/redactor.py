@@ -25,6 +25,7 @@ log = logging.getLogger("pii-proxy.redactor")
 CLAUDE_DIR = os.path.join(os.path.expanduser("~"), ".claude")
 SECRET_PATH = os.path.join(CLAUDE_DIR, "pii-proxy.secret")
 MAP_PATH = os.path.join(CLAUDE_DIR, "pii-proxy-map.json")
+SPAN_CACHE_PATH = os.path.join(CLAUDE_DIR, "pii-proxy-spans.json")
 
 # Tags that Claude Code injects whose content changes between turns
 # (timestamps, command output, deferred-tool lists, etc.). Hashing the text
@@ -150,8 +151,9 @@ class Redactor:
         self,
         model_id: str = "openai/privacy-filter",
         min_score: float = 0.5,
-        cache_size: int = 4096,
+        cache_size: int = 65536,
         engine: PrivacyFilterEngine | None = None,
+        persist_cache: bool = True,
     ) -> None:
         self.model_id = model_id
         self.min_score = min_score
@@ -160,10 +162,46 @@ class Redactor:
         self.map = TokenMap()
         self._engine = engine or PrivacyFilterEngine(model_id=model_id, min_score=min_score)
         self._span_cache: dict[str, list[dict]] = {}
+        self._span_cache_lock = threading.Lock()
+        self._span_cache_path = SPAN_CACHE_PATH if persist_cache else None
+        self._span_cache_dirty = False
+        self._load_span_cache()
 
     def warmup(self) -> None:
         """Pre-load the ONNX model so first request doesn't pay the load cost."""
         self._engine.load()
+
+    # ---------- persistent span cache ----------
+
+    def _load_span_cache(self) -> None:
+        if not self._span_cache_path or not os.path.exists(self._span_cache_path):
+            return
+        try:
+            with open(self._span_cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._span_cache = {str(k): list(v) for k, v in data.items() if isinstance(v, list)}
+                log.info(f"[INIT] Loaded {len(self._span_cache)} span cache entries")
+        except Exception as e:
+            log.warning(f"[INIT] Could not load span cache: {e}")
+
+    def save_span_cache(self) -> None:
+        """Atomically persist the span cache. No-op if nothing changed since
+        the last save. Cheap to call from request handlers — large caches
+        write a few hundred KB at most."""
+        if not self._span_cache_path:
+            return
+        with self._span_cache_lock:
+            if not self._span_cache_dirty:
+                return
+            tmp = self._span_cache_path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self._span_cache, f, ensure_ascii=False)
+                os.replace(tmp, self._span_cache_path)
+                self._span_cache_dirty = False
+            except Exception as e:
+                log.warning(f"[CACHE] Could not save span cache: {e}")
 
     # ---------- token minting ----------
 
@@ -320,15 +358,19 @@ class Redactor:
             except Exception as e:
                 log.warning(f"[DETECT] batch failed: {e}; falling back to per-text")
                 batch_spans = [self._engine.detect(t) for t in miss_texts]
-            # Trim cache before inserting
-            if len(self._span_cache) >= self._cache_size:
-                for k in list(self._span_cache.keys())[: self._cache_size // 4]:
-                    self._span_cache.pop(k, None)
-            for (ti, ci, ctext, is_volatile), spans in zip(miss_jobs, batch_spans):
-                chunk_spans[(ti, ci)] = spans
-                if not is_volatile:
-                    h = hashlib.sha1(ctext.encode("utf-8", errors="replace")).hexdigest()
-                    self._span_cache[h] = spans
+            with self._span_cache_lock:
+                if len(self._span_cache) >= self._cache_size:
+                    for k in list(self._span_cache.keys())[: self._cache_size // 4]:
+                        self._span_cache.pop(k, None)
+                added = 0
+                for (ti, ci, ctext, is_volatile), spans in zip(miss_jobs, batch_spans):
+                    chunk_spans[(ti, ci)] = spans
+                    if not is_volatile:
+                        h = hashlib.sha1(ctext.encode("utf-8", errors="replace")).hexdigest()
+                        self._span_cache[h] = spans
+                        added += 1
+                if added:
+                    self._span_cache_dirty = True
 
         # (3) Combine chunk spans into target-relative spans, then apply.
         for ti, (text, setter) in enumerate(targets):

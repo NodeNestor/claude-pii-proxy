@@ -232,6 +232,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 conn.close()
             except Exception:
                 pass
+            # Persist any new span-cache entries from this request so they
+            # survive proxy restarts. Cheap atomic write; a no-op if nothing
+            # was added.
+            try:
+                redactor.save_span_cache()
+            except Exception as e:
+                log.warning(f"[CACHE] save failed: {e}")
 
     def _forward_full(self, resp):
         body = resp.read()
