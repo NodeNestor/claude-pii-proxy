@@ -111,6 +111,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         log.info(f"[REQ] POST {self.path}")
         if self.path.startswith("/v1/messages"):
             self._handle_messages()
+        elif self.path == "/admin/cache/clear":
+            self._handle_admin_cache_clear()
+        elif self.path == "/admin/tokens/clear":
+            self._handle_admin_tokens_clear()
         else:
             self._proxy_raw("POST")
 
@@ -118,6 +122,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         log.info(f"[REQ] GET {self.path}")
         if self.path == "/health":
             self._handle_health()
+        elif self.path == "/stats":
+            self._handle_stats()
         elif self.path == "/debug/map":
             self._handle_debug_map()
         else:
@@ -158,6 +164,120 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Don't dump real values — only counts and token examples.
         sample = list(redactor.map._token_to_real.keys())[:10]
         self._send_json(200, {"count": len(redactor.map), "tokens_sample": sample})
+
+    def _send_text(self, status: int, body: str):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "text/plain; charset=utf-8")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_stats(self):
+        # Plain text rather than JSON so the slash-command output renders nicely.
+        from redactor import MAP_PATH, SPAN_CACHE_PATH, SECRET_PATH
+        eng = redactor._engine
+        try:
+            providers = eng._session.get_providers() if eng._session is not None else []
+        except Exception:
+            providers = []
+        try:
+            input_names = eng._input_names
+        except Exception:
+            input_names = []
+        cache_bytes = os.path.getsize(SPAN_CACHE_PATH) if os.path.exists(SPAN_CACHE_PATH) else 0
+        map_bytes = os.path.getsize(MAP_PATH) if os.path.exists(MAP_PATH) else 0
+
+        def hsize(n: int) -> str:
+            if n < 1024:
+                return f"{n} B"
+            if n < 1024 * 1024:
+                return f"{n / 1024:.1f} KB"
+            return f"{n / (1024 * 1024):.1f} MB"
+
+        out = []
+        out.append("Claude PII Proxy")
+        out.append("=" * 60)
+        out.append(f"  Status     : ok")
+        out.append(f"  Upstream   : {UPSTREAM_URL}")
+        out.append(f"  Listen port: {LISTEN_PORT}")
+        out.append("")
+        out.append("Model")
+        out.append(f"  ID         : {redactor.model_id}")
+        out.append(f"  Quant pin  : {os.environ.get('PII_PROXY_QUANT', '(auto)')}")
+        out.append(f"  Min score  : {redactor.min_score}")
+        out.append(f"  Loaded     : {'yes' if eng._session is not None else 'no (lazy)'}")
+        out.append(f"  Providers  : {', '.join(providers) or '(unloaded)'}")
+        out.append(f"  Inputs     : {', '.join(input_names) or '(unloaded)'}")
+        out.append("")
+        out.append("Token map (real ↔ tokens)")
+        out.append(f"  Path       : {MAP_PATH}")
+        out.append(f"  Size       : {hsize(map_bytes)}")
+        out.append(f"  Mappings   : {len(redactor.map)}")
+        out.append("")
+        out.append("Span cache (detected PII per chunk)")
+        out.append(f"  Path       : {SPAN_CACHE_PATH}")
+        out.append(f"  Size       : {hsize(cache_bytes)}")
+        out.append(f"  In memory  : {len(redactor._span_cache)} entries / cap {redactor._cache_size}")
+        out.append("")
+        out.append("HMAC secret")
+        out.append(f"  Path       : {SECRET_PATH}")
+        out.append("")
+        out.append("Tunables (set via env / settings.json `env`)")
+        out.append("  PII_PROXY_PORT, PII_PROXY_UPSTREAM, PII_PROXY_QUANT,")
+        out.append("  PII_PROXY_PROVIDERS (e.g. CUDAExecutionProvider,CPUExecutionProvider),")
+        out.append("  PII_PROXY_THREADS, PII_PROXY_MIN_SCORE, PII_PROXY_WARMUP")
+        self._send_text(200, "\n".join(out) + "\n")
+
+    def _handle_admin_cache_clear(self):
+        from redactor import SPAN_CACHE_PATH
+        # Read body for JSON option {"keep_tokens": bool} (default true)
+        try:
+            body = self._read_body()
+            opts = json.loads(body) if body else {}
+        except Exception:
+            opts = {}
+        with redactor._span_cache_lock:
+            removed_in_mem = len(redactor._span_cache)
+            redactor._span_cache.clear()
+            redactor._span_cache_dirty = True
+        on_disk_bytes = 0
+        if os.path.exists(SPAN_CACHE_PATH):
+            on_disk_bytes = os.path.getsize(SPAN_CACHE_PATH)
+            try:
+                os.remove(SPAN_CACHE_PATH)
+            except Exception as e:
+                log.warning(f"[ADMIN] could not remove span cache: {e}")
+        msg = (
+            f"Span cache cleared.\n"
+            f"  In-memory entries dropped : {removed_in_mem}\n"
+            f"  Disk file removed         : {SPAN_CACHE_PATH}\n"
+            f"  Disk space freed          : {on_disk_bytes} bytes\n"
+            f"  Token map kept            : {len(redactor.map)} mappings preserved\n"
+            f"  (Restoration of historical tokens still works.)\n"
+        )
+        self._send_text(200, msg)
+
+    def _handle_admin_tokens_clear(self):
+        from redactor import MAP_PATH
+        prev_count = len(redactor.map)
+        with redactor.map._lock:
+            redactor.map._token_to_real.clear()
+            redactor.map._real_to_token.clear()
+            try:
+                if os.path.exists(MAP_PATH):
+                    os.remove(MAP_PATH)
+            except Exception as e:
+                log.warning(f"[ADMIN] could not remove token map: {e}")
+        msg = (
+            f"Token map cleared.\n"
+            f"  Mappings dropped : {prev_count}\n"
+            f"  File removed     : {MAP_PATH}\n"
+            f"  Span cache kept  : {len(redactor._span_cache)} entries\n"
+            f"  WARNING: any token still alive in past conversation history will\n"
+            f"  no longer be restorable on the way back from the API.\n"
+        )
+        self._send_text(200, msg)
 
     def _proxy_raw(self, method: str):
         body = self._read_body()
