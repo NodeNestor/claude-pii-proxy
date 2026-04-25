@@ -106,11 +106,23 @@ All env vars can be set in `~/.claude/settings.json` under `env`:
 | `PII_PROXY_MIN_SCORE` | `0.5` | Minimum classifier confidence to redact |
 | `PII_PROXY_WARMUP` | `1` | Pre-load the model at startup |
 
+## Slash commands
+
+| Command | What it does |
+|---|---|
+| `/pii-stats` | Show config, providers, cache sizes, mapping count |
+| `/pii-config` | Show how to change settings (quant, providers, threads, ports) |
+| `/pii-clear-cache` | Drop the span detection cache (token map kept — safe) |
+| `/pii-clear-tokens --confirm` | Wipe token↔value map (DANGEROUS — past tokens stop restoring) |
+| `/pii-gpu cuda\|directml\|coreml\|cpu` | Switch ORT package + provider, restart Claude Code |
+
 ## Health & debug
 
 ```bash
-curl http://127.0.0.1:5599/health
-curl http://127.0.0.1:5599/debug/map
+curl http://127.0.0.1:5599/stats           # human-readable
+curl http://127.0.0.1:5599/health          # JSON
+curl -X POST http://127.0.0.1:5599/admin/cache/clear
+curl -X POST http://127.0.0.1:5599/admin/tokens/clear
 ```
 
 Logs:
