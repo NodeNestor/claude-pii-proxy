@@ -171,8 +171,25 @@ redacted there, because the substitution would break the path.
 | Warmed-up 10-turn conversation, per turn | ~175 ms |
 | 1M-token-equivalent conversation, **subsequent turns** | **0 ms** |
 
-GPU via `/pii-gpu cuda` typically delivers a 10–30× cold-path speedup on
-NVIDIA hardware.
+## GPU vs CPU — measured
+
+For this model (50 M active params, MoE, int8) GPU is not a universal speedup.
+Numbers from `onnxruntime-gpu 1.25` on Windows + driver 591.86 / CUDA 12.8:
+
+| Input | CPU (24-core, 8 ORT threads) | RTX 5060 Ti | RTX 4060 |
+|---|---|---|---|
+| Single short string | ~45 ms | ~44 ms | ~230 ms |
+| Batch of 16 short strings | ~89 ms | ~80 ms | ~265 ms |
+| 25 KB doc (cold) | ~3.8 s | ~1.05 s | ~1.66 s |
+
+**Read this as:** CPU is the right default for typical Claude Code conversations
+(short messages, lots of cache hits). CUDA on a strong GPU helps mainly for
+cold-start on long pastes (3–4× speedup on a 25 KB doc, scaling further for
+larger docs and 1 M-token first turns). On weaker GPUs (the 4060 here) CUDA
+can be slower than CPU for short inputs because kernel-launch overhead
+dominates.
+
+If you regularly paste big docs, run `/pii-gpu cuda`. Otherwise stay on CPU.
 
 ## Limitations
 
