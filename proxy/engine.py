@@ -165,6 +165,74 @@ def _bucket_size(n: int) -> int:
     return ((n + 1023) // 1024) * 1024
 
 
+# Long-text sub-chunking. The model has a 128K-token context window, but
+# accuracy holds best (and latency is much lower) on shorter chunks. Inputs
+# above ``MAX_DETECT_CHARS`` get split into overlapping sub-chunks so that
+# (a) we don't truncate huge code/document pastes and lose PII past the
+# limit, and (b) each sub-chunk is small enough to fit a fast forward pass.
+MAX_DETECT_CHARS = 8000  # ~2K tokens
+OVERLAP_CHARS = 320      # > longest plausible PII span (addresses ~50 chars)
+
+
+def _split_long(text: str, max_chars: int = MAX_DETECT_CHARS, overlap: int = OVERLAP_CHARS) -> list[tuple[str, int]]:
+    """Return ``[(sub_text, char_offset_in_original), ...]``.
+
+    For texts <= ``max_chars`` returns a single piece at offset 0. Above that,
+    splits at fixed positions with ``overlap`` chars of overlap so PII near
+    chunk boundaries is seen in full by at least one sub-chunk.
+    """
+    if len(text) <= max_chars:
+        return [(text, 0)]
+    chunks: list[tuple[str, int]] = []
+    pos = 0
+    while pos < len(text):
+        end = min(pos + max_chars, len(text))
+        chunks.append((text[pos:end], pos))
+        if end >= len(text):
+            break
+        next_pos = end - overlap
+        if next_pos <= pos:  # safety: prevent infinite loop on tiny max/overlap
+            next_pos = pos + 1
+        pos = next_pos
+    return chunks
+
+
+def _dedupe_spans(spans: list[dict]) -> list[dict]:
+    """Drop duplicate / subsumed spans that come from overlapping sub-chunks.
+
+    A span is considered subsumed by another when they share the same category
+    and the second covers a strictly wider range. Exact duplicates collapse to
+    the highest-scored one.
+    """
+    if len(spans) <= 1:
+        return spans
+    # Sort by start asc, end desc, score desc
+    spans = sorted(spans, key=lambda s: (s["start"], -s["end"], -s["score"]))
+    out: list[dict] = []
+    for s in spans:
+        absorbed = False
+        for e in out:
+            if (
+                e["category"] == s["category"]
+                and e["start"] <= s["start"]
+                and e["end"] >= s["end"]
+            ):
+                absorbed = True
+                break
+        if absorbed:
+            continue
+        out = [
+            e for e in out
+            if not (
+                s["category"] == e["category"]
+                and s["start"] <= e["start"]
+                and s["end"] >= e["end"]
+            )
+        ]
+        out.append(s)
+    return sorted(out, key=lambda s: s["start"])
+
+
 # ---------------------------------------------------------------------------
 # BIOES decoding
 # ---------------------------------------------------------------------------
@@ -352,21 +420,44 @@ class PrivacyFilterEngine:
         return self.detect_batch([text])[0]
 
     def detect_batch(self, texts: list[str]) -> list[list[dict]]:
-        """Run forward passes over a batch of texts, length-bucketed.
+        """Detect spans across a batch of texts. Long texts are sub-chunked
+        with overlap so we never truncate PII past the model's context window.
+        Short texts pass through unchanged. Returns a list of span lists,
+        index-aligned with ``texts`` (positions are relative to each input)."""
+        if not texts:
+            return []
+        self.load()
 
-        Plain padding-to-max wastes work when batch lengths are uneven (a
-        single 2k-token system prompt would force ten 30-token messages to
-        also be padded to 2k). Instead, we bucket by power-of-two padded
-        length and run one forward pass per bucket — short strings stay
-        short, long strings don't get split.
+        # Expand each text into sub-chunks (long texts only).
+        expansions: list[tuple[int, int, str]] = []  # (orig_idx, char_offset, sub_text)
+        for i, t in enumerate(texts):
+            for sub_text, offset in _split_long(t):
+                expansions.append((i, offset, sub_text))
 
-        Returns a list of span lists index-aligned with ``texts``.
-        """
+        sub_texts = [e[2] for e in expansions]
+        sub_spans = self._detect_batch_raw(sub_texts)
+
+        # Re-assemble per original text with offset adjustment.
+        results: list[list[dict]] = [[] for _ in texts]
+        for (orig_idx, offset, _), spans in zip(expansions, sub_spans):
+            if offset == 0:
+                results[orig_idx].extend(spans)
+                continue
+            for sp in spans:
+                shifted = dict(sp)
+                shifted["start"] += offset
+                shifted["end"] += offset
+                results[orig_idx].append(shifted)
+
+        # Drop duplicates that arose from the overlap region.
+        return [_dedupe_spans(r) for r in results]
+
+    def _detect_batch_raw(self, texts: list[str]) -> list[list[dict]]:
+        """Bucketed forward passes over already-sized inputs (no sub-chunking)."""
         import numpy as np
 
         if not texts:
             return []
-        self.load()
 
         # Tokenise once, no padding (we'll pad per bucket below).
         encodings = [self._tokenizer.encode(t) for t in texts]

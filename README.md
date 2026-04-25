@@ -33,6 +33,15 @@ Claude Code  ──►  PII Proxy (:5599)  ──►  Anthropic API
   even when Claude Code refreshes `<system-reminder>` timestamps each
   request. After warmup, a 10-message conversation reduces from ~10 cache
   misses per turn to ~1.
+* **1M-context support**: inputs longer than ~8 000 chars are split into
+  overlapping sub-chunks (each fits one fast forward pass), so PII past
+  the model's effective window isn't truncated and lost. Each sub-chunk
+  hashes/caches independently — re-sending the same 100 KB code paste
+  costs 0 ms after the first time.
+* **Persistent span cache** at `~/.claude/pii-proxy-spans.json`: detection
+  results survive proxy restarts and are shared across Claude Code
+  sessions. Slow cold-start happens at most once per unique chunk on
+  this machine, ever.
 * Override quantization with `PII_PROXY_QUANT` (e.g. `model_q4f16.onnx` for
   ~770 MB on disk vs 1.5 GB int8, at ~10× higher latency).
 * Override providers with `PII_PROXY_PROVIDERS=CUDAExecutionProvider,...`
