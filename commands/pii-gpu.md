@@ -1,5 +1,5 @@
 ---
-description: Switch the PII proxy to GPU inference (NVIDIA/CUDA, AMD/Intel via DirectML, or Apple CoreML). Reinstalls onnxruntime in the proxy venv and updates settings.json. Restart Claude Code afterwards.
+description: Switch the PII proxy to GPU inference (NVIDIA/CUDA, AMD/Intel via DirectML, or Apple CoreML). Reinstalls onnxruntime in the proxy venv and updates settings.json. Restart Claude Code afterwards. Note — for typical short-message Claude Code conversations CPU is usually faster; CUDA mainly helps for cold-start on long pastes / first 1M-context turn (~3-4× speedup measured on RTX 5060 Ti).
 disable-model-invocation: true
 allowed-tools: Bash
 ---
