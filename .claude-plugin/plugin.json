@@ -1,6 +1,6 @@
 {
   "name": "pii-proxy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Round-trip PII redaction for Claude Code. Replaces names, emails, phones, addresses, URLs, dates, account numbers, and secrets with deterministic placeholder tokens before they hit Anthropic, and restores the real values in the response.",
   "author": {
     "name": "NodeNestor"

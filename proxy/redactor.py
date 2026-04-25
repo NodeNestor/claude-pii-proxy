@@ -25,7 +25,9 @@ log = logging.getLogger("pii-proxy.redactor")
 CLAUDE_DIR = os.path.join(os.path.expanduser("~"), ".claude")
 SECRET_PATH = os.path.join(CLAUDE_DIR, "pii-proxy.secret")
 MAP_PATH = os.path.join(CLAUDE_DIR, "pii-proxy-map.json")
-SPAN_CACHE_PATH = os.path.join(CLAUDE_DIR, "pii-proxy-spans.json")
+SPAN_CACHE_PATH = os.path.join(CLAUDE_DIR, "pii-proxy-spans.jsonl")
+# Older builds wrote a single big JSON file; we migrate it on first load.
+SPAN_CACHE_LEGACY_JSON_PATH = os.path.join(CLAUDE_DIR, "pii-proxy-spans.json")
 
 # Tags that Claude Code injects whose content changes between turns
 # (timestamps, command output, deferred-tool lists, etc.). Hashing the text
@@ -151,57 +153,93 @@ class Redactor:
         self,
         model_id: str = "openai/privacy-filter",
         min_score: float = 0.5,
-        cache_size: int = 65536,
         engine: PrivacyFilterEngine | None = None,
         persist_cache: bool = True,
     ) -> None:
         self.model_id = model_id
         self.min_score = min_score
-        self._cache_size = cache_size
         self._secret = _load_or_create_secret()
         self.map = TokenMap()
         self._engine = engine or PrivacyFilterEngine(model_id=model_id, min_score=min_score)
         self._span_cache: dict[str, list[dict]] = {}
         self._span_cache_lock = threading.Lock()
         self._span_cache_path = SPAN_CACHE_PATH if persist_cache else None
-        self._span_cache_dirty = False
         self._load_span_cache()
 
     def warmup(self) -> None:
         """Pre-load the ONNX model so first request doesn't pay the load cost."""
         self._engine.load()
 
-    # ---------- persistent span cache ----------
+    # ---------- persistent span cache (append-only JSONL, unbounded) ----------
+    #
+    # Once a chunk has been inferenced, the cost is paid; we keep the result
+    # forever. Writing each new entry as a single JSON line means writes are
+    # O(new entries) per request rather than O(whole cache), so growth doesn't
+    # turn into a per-request latency cliff. Compaction (deduping rewritten
+    # entries on disk) happens on next process load.
 
     def _load_span_cache(self) -> None:
-        if not self._span_cache_path or not os.path.exists(self._span_cache_path):
+        if not self._span_cache_path:
             return
+        # One-shot migration from the legacy whole-file JSON dump.
+        if (
+            not os.path.exists(self._span_cache_path)
+            and os.path.exists(SPAN_CACHE_LEGACY_JSON_PATH)
+        ):
+            try:
+                with open(SPAN_CACHE_LEGACY_JSON_PATH, "r", encoding="utf-8") as f:
+                    legacy = json.load(f)
+                if isinstance(legacy, dict):
+                    items = [(k, v) for k, v in legacy.items() if isinstance(v, list)]
+                    self._append_jsonl(items)
+                    log.info(
+                        f"[INIT] Migrated {len(items)} span cache entries from legacy "
+                        f"{SPAN_CACHE_LEGACY_JSON_PATH} to {self._span_cache_path}"
+                    )
+                os.replace(SPAN_CACHE_LEGACY_JSON_PATH, SPAN_CACHE_LEGACY_JSON_PATH + ".bak")
+            except Exception as e:
+                log.warning(f"[INIT] Legacy span cache migration failed: {e}")
+
+        if not os.path.exists(self._span_cache_path):
+            return
+        loaded = 0
         try:
             with open(self._span_cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self._span_cache = {str(k): list(v) for k, v in data.items() if isinstance(v, list)}
-                log.info(f"[INIT] Loaded {len(self._span_cache)} span cache entries")
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    h = rec.get("h")
+                    spans = rec.get("s")
+                    if isinstance(h, str) and isinstance(spans, list):
+                        self._span_cache[h] = spans  # last-write-wins on duplicates
+                        loaded += 1
+            log.info(f"[INIT] Loaded {len(self._span_cache)} span cache entries ({loaded} JSONL records)")
         except Exception as e:
             log.warning(f"[INIT] Could not load span cache: {e}")
 
-    def save_span_cache(self) -> None:
-        """Atomically persist the span cache. No-op if nothing changed since
-        the last save. Cheap to call from request handlers — large caches
-        write a few hundred KB at most."""
-        if not self._span_cache_path:
+    def _append_jsonl(self, items: list[tuple[str, list[dict]]]) -> None:
+        """Append ``items`` to the on-disk JSONL store. Caller holds no lock;
+        we acquire briefly for the write."""
+        if not self._span_cache_path or not items:
             return
-        with self._span_cache_lock:
-            if not self._span_cache_dirty:
-                return
-            tmp = self._span_cache_path + ".tmp"
-            try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(self._span_cache, f, ensure_ascii=False)
-                os.replace(tmp, self._span_cache_path)
-                self._span_cache_dirty = False
-            except Exception as e:
-                log.warning(f"[CACHE] Could not save span cache: {e}")
+        try:
+            with self._span_cache_lock:
+                with open(self._span_cache_path, "a", encoding="utf-8") as f:
+                    for h, spans in items:
+                        f.write(json.dumps({"h": h, "s": spans}, ensure_ascii=False))
+                        f.write("\n")
+        except Exception as e:
+            log.warning(f"[CACHE] could not append to span cache: {e}")
+
+    # Kept for compatibility with the server's per-request hook; appends
+    # happen inline now, so this is a no-op.
+    def save_span_cache(self) -> None:
+        return
 
     # ---------- token minting ----------
 
@@ -358,19 +396,15 @@ class Redactor:
             except Exception as e:
                 log.warning(f"[DETECT] batch failed: {e}; falling back to per-text")
                 batch_spans = [self._engine.detect(t) for t in miss_texts]
-            with self._span_cache_lock:
-                if len(self._span_cache) >= self._cache_size:
-                    for k in list(self._span_cache.keys())[: self._cache_size // 4]:
-                        self._span_cache.pop(k, None)
-                added = 0
-                for (ti, ci, ctext, is_volatile), spans in zip(miss_jobs, batch_spans):
-                    chunk_spans[(ti, ci)] = spans
-                    if not is_volatile:
-                        h = hashlib.sha1(ctext.encode("utf-8", errors="replace")).hexdigest()
-                        self._span_cache[h] = spans
-                        added += 1
-                if added:
-                    self._span_cache_dirty = True
+            new_persist: list[tuple[str, list[dict]]] = []
+            for (ti, ci, ctext, is_volatile), spans in zip(miss_jobs, batch_spans):
+                chunk_spans[(ti, ci)] = spans
+                if not is_volatile:
+                    h = hashlib.sha1(ctext.encode("utf-8", errors="replace")).hexdigest()
+                    self._span_cache[h] = spans
+                    new_persist.append((h, spans))
+            if new_persist:
+                self._append_jsonl(new_persist)
 
         # (3) Combine chunk spans into target-relative spans, then apply.
         for ti, (text, setter) in enumerate(targets):
