@@ -152,6 +152,19 @@ def _softmax(x):
     return e / e.sum(axis=-1, keepdims=True)
 
 
+# Power-of-two-ish bucketing to limit padding waste while keeping the number
+# of distinct shapes (and therefore ORT's compiled kernels) bounded.
+_BUCKETS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+
+
+def _bucket_size(n: int) -> int:
+    for b in _BUCKETS:
+        if n <= b:
+            return b
+    # Round up to the next 1024 for very long inputs
+    return ((n + 1023) // 1024) * 1024
+
+
 # ---------------------------------------------------------------------------
 # BIOES decoding
 # ---------------------------------------------------------------------------
@@ -304,10 +317,27 @@ class PrivacyFilterEngine:
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             so.log_severity_level = 3
+            # Tune CPU threading. 0 = let ORT decide (sometimes under-uses cores).
+            # Override with PII_PROXY_THREADS=N for explicit control.
+            threads_env = os.environ.get("PII_PROXY_THREADS")
+            if threads_env:
+                try:
+                    so.intra_op_num_threads = int(threads_env)
+                except ValueError:
+                    pass
+            else:
+                # Default: half of logical cores, capped at 8 — beyond that
+                # int8 GEMM kernels usually contend more than they parallelise.
+                cpu_count = os.cpu_count() or 4
+                so.intra_op_num_threads = min(8, max(2, cpu_count // 2))
+            so.inter_op_num_threads = 1
             providers = _pick_providers()
             self._session = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
             self._input_names = [i.name for i in self._session.get_inputs()]
-            log.info(f"[ENGINE] Ready. Inputs: {self._input_names}")
+            log.info(
+                f"[ENGINE] Ready. Inputs: {self._input_names}  "
+                f"intra_op_threads={so.intra_op_num_threads}"
+            )
 
     # ---- inference ----
 
@@ -322,11 +352,15 @@ class PrivacyFilterEngine:
         return self.detect_batch([text])[0]
 
     def detect_batch(self, texts: list[str]) -> list[list[dict]]:
-        """Run a single forward pass over a batch of texts.
+        """Run forward passes over a batch of texts, length-bucketed.
 
-        Much faster than N sequential calls — one kernel launch, padded
-        attention mask ignores filler tokens. Returns a list of span lists,
-        index-aligned with the input texts.
+        Plain padding-to-max wastes work when batch lengths are uneven (a
+        single 2k-token system prompt would force ten 30-token messages to
+        also be padded to 2k). Instead, we bucket by power-of-two padded
+        length and run one forward pass per bucket — short strings stay
+        short, long strings don't get split.
+
+        Returns a list of span lists index-aligned with ``texts``.
         """
         import numpy as np
 
@@ -334,66 +368,78 @@ class PrivacyFilterEngine:
             return []
         self.load()
 
-        # Tokenise in batch with right-padding to the longest example, using
-        # the model's actual pad token id so the model treats padded positions
-        # as filler rather than as real content.
-        self._tokenizer.enable_padding(pad_id=self._pad_id, pad_token=self._pad_token)
-        try:
-            encodings = self._tokenizer.encode_batch(texts)
-        finally:
-            self._tokenizer.no_padding()
+        # Tokenise once, no padding (we'll pad per bucket below).
+        encodings = [self._tokenizer.encode(t) for t in texts]
 
-        max_len = max(len(e.ids) for e in encodings)
-        batch_size = len(encodings)
-        ids = np.zeros((batch_size, max_len), dtype=np.int64)
-        mask = np.zeros((batch_size, max_len), dtype=np.int64)
+        # Group indices by bucket size.
+        buckets: dict[int, list[int]] = {}
+        empty_indices: list[int] = []
         for i, e in enumerate(encodings):
             n = len(e.ids)
-            ids[i, :n] = e.ids
-            mask[i, :n] = e.attention_mask
+            if n == 0:
+                empty_indices.append(i)
+                continue
+            b = _bucket_size(n)
+            buckets.setdefault(b, []).append(i)
 
-        feed: dict[str, "np.ndarray"] = {}
-        if "input_ids" in self._input_names:
-            feed["input_ids"] = ids
-        if "attention_mask" in self._input_names:
-            feed["attention_mask"] = mask
-        if "token_type_ids" in self._input_names:
-            feed["token_type_ids"] = np.zeros_like(ids)
+        results: list[list[dict] | None] = [None] * len(texts)
+        for i in empty_indices:
+            results[i] = []
 
-        outputs = self._session.run(None, feed)
-        logits = outputs[0]  # (batch, max_len, num_classes)
-        probs = _softmax(logits)
-        label_ids = probs.argmax(axis=-1)
-        scores = probs.max(axis=-1)
+        for bucket_len, idxs in buckets.items():
+            bsize = len(idxs)
+            ids = np.full((bsize, bucket_len), self._pad_id, dtype=np.int64)
+            mask = np.zeros((bsize, bucket_len), dtype=np.int64)
+            for row, src in enumerate(idxs):
+                e = encodings[src]
+                n = len(e.ids)
+                ids[row, :n] = e.ids
+                mask[row, :n] = e.attention_mask
 
-        results: list[list[dict]] = []
-        for i, enc in enumerate(encodings):
-            real_len = int(mask[i].sum())
-            spans = _decode_bioes(
-                label_ids=label_ids[i, :real_len],
-                scores=scores[i, :real_len],
-                offsets=enc.offsets[:real_len],
-                id2label=self._id2label,
-                text=texts[i],
-            )
-            cleaned: list[dict] = []
-            for s in spans:
-                if s["score"] < self.min_score:
-                    continue
-                real = s["real"]
-                stripped = real.strip()
-                if not stripped:
-                    continue
-                lead = len(real) - len(real.lstrip())
-                trail = len(real) - len(real.rstrip())
-                cleaned.append(
-                    {
-                        "start": s["start"] + lead,
-                        "end": s["end"] - trail,
-                        "category": s["category"],
-                        "real": stripped,
-                        "score": s["score"],
-                    }
+            feed: dict[str, "np.ndarray"] = {}
+            if "input_ids" in self._input_names:
+                feed["input_ids"] = ids
+            if "attention_mask" in self._input_names:
+                feed["attention_mask"] = mask
+            if "token_type_ids" in self._input_names:
+                feed["token_type_ids"] = np.zeros_like(ids)
+
+            outputs = self._session.run(None, feed)
+            logits = outputs[0]
+            probs = _softmax(logits)
+            label_ids = probs.argmax(axis=-1)
+            scores = probs.max(axis=-1)
+
+            for row, src in enumerate(idxs):
+                e = encodings[src]
+                real_len = len(e.ids)
+                spans = _decode_bioes(
+                    label_ids=label_ids[row, :real_len],
+                    scores=scores[row, :real_len],
+                    offsets=e.offsets[:real_len],
+                    id2label=self._id2label,
+                    text=texts[src],
                 )
-            results.append(cleaned)
-        return results
+                cleaned: list[dict] = []
+                for s in spans:
+                    if s["score"] < self.min_score:
+                        continue
+                    real = s["real"]
+                    stripped = real.strip()
+                    if not stripped:
+                        continue
+                    lead = len(real) - len(real.lstrip())
+                    trail = len(real) - len(real.rstrip())
+                    cleaned.append(
+                        {
+                            "start": s["start"] + lead,
+                            "end": s["end"] - trail,
+                            "category": s["category"],
+                            "real": stripped,
+                            "score": s["score"],
+                        }
+                    )
+                results[src] = cleaned
+
+        # All indices should be filled by now
+        return [r if r is not None else [] for r in results]
