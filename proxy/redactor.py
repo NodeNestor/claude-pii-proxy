@@ -26,6 +26,41 @@ CLAUDE_DIR = os.path.join(os.path.expanduser("~"), ".claude")
 SECRET_PATH = os.path.join(CLAUDE_DIR, "pii-proxy.secret")
 MAP_PATH = os.path.join(CLAUDE_DIR, "pii-proxy-map.json")
 
+# Tags that Claude Code injects whose content changes between turns
+# (timestamps, command output, deferred-tool lists, etc.). Hashing the text
+# *with* these tags causes a cache miss every turn for the same logical
+# message; stripping them for the cache key gives us reliable hits across
+# turns. Tag content still gets PII-detected on the full text.
+_VOLATILE_TAGS_RE = re.compile(
+    r"<(?:system-reminder|local-command-caveat|local-command-stdout|"
+    r"available-deferred-tools)>.*?</(?:system-reminder|local-command-caveat|"
+    r"local-command-stdout|available-deferred-tools)>",
+    re.DOTALL,
+)
+
+
+def _split_by_volatile_tags(text: str) -> tuple[list[tuple[str, bool, int]], str]:
+    """Return (chunks, stable_concat) where chunks is a list of
+    ``(chunk_text, is_volatile, offset_in_original)`` and stable_concat is the
+    concatenation of stable (non-volatile) chunks — a stable cache key under
+    Claude Code's tag-injection behaviour.
+    """
+    chunks: list[tuple[str, bool, int]] = []
+    cursor = 0
+    stable_parts: list[str] = []
+    for m in _VOLATILE_TAGS_RE.finditer(text):
+        if m.start() > cursor:
+            chunk = text[cursor : m.start()]
+            chunks.append((chunk, False, cursor))
+            stable_parts.append(chunk)
+        chunks.append((text[m.start() : m.end()], True, m.start()))
+        cursor = m.end()
+    if cursor < len(text):
+        chunk = text[cursor:]
+        chunks.append((chunk, False, cursor))
+        stable_parts.append(chunk)
+    return chunks, "".join(stable_parts)
+
 # Matches any token we may have minted, e.g. "name-a3f2b1"
 TOKEN_PATTERN = re.compile(
     r"\b(name|email|phone|address|url|date|account|secret)-[0-9a-f]{6}\b"
@@ -251,45 +286,62 @@ class Redactor:
         if not targets:
             return payload
 
-        # (2) Resolve cached spans first, batch-detect the cache misses.
-        texts = [t for t, _ in targets]
-        cached_spans: list[list[dict] | None] = []
-        miss_indices: list[int] = []
-        miss_texts: list[str] = []
-        for i, text in enumerate(texts):
-            if not text or len(text) < 3 or not any(c.isalpha() for c in text):
-                cached_spans.append([])
-                continue
-            h = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
-            cached = self._span_cache.get(h)
-            if cached is not None:
-                cached_spans.append(cached)
-            else:
-                cached_spans.append(None)
-                miss_indices.append(i)
-                miss_texts.append(text)
+        # (2) Split each target into stable + volatile chunks. Stable chunks
+        #     cache by content hash and survive Claude Code's tag-injection;
+        #     volatile chunks (system-reminder, command-stdout, etc.) get
+        #     detected fresh each call but are typically tiny.
+        per_target_chunks: list[list[tuple[str, bool, int]]] = []
+        for text, _ in targets:
+            chunks, _ = _split_by_volatile_tags(text)
+            per_target_chunks.append(chunks)
 
-        if miss_texts:
+        chunk_spans: dict[tuple[int, int], list[dict]] = {}
+        miss_jobs: list[tuple[int, int, str, bool]] = []  # (target_idx, chunk_idx, text, is_volatile)
+
+        for ti, chunks in enumerate(per_target_chunks):
+            for ci, (ctext, is_volatile, _off) in enumerate(chunks):
+                if not ctext or len(ctext) < 3 or not any(c.isalpha() for c in ctext):
+                    chunk_spans[(ti, ci)] = []
+                    continue
+                if is_volatile:
+                    miss_jobs.append((ti, ci, ctext, True))
+                    continue
+                h = hashlib.sha1(ctext.encode("utf-8", errors="replace")).hexdigest()
+                cached = self._span_cache.get(h)
+                if cached is not None:
+                    chunk_spans[(ti, ci)] = cached
+                else:
+                    miss_jobs.append((ti, ci, ctext, False))
+
+        if miss_jobs:
+            miss_texts = [j[2] for j in miss_jobs]
             try:
                 batch_spans = self._engine.detect_batch(miss_texts)
             except Exception as e:
                 log.warning(f"[DETECT] batch failed: {e}; falling back to per-text")
                 batch_spans = [self._engine.detect(t) for t in miss_texts]
-            # Cache and slot back in
+            # Trim cache before inserting
             if len(self._span_cache) >= self._cache_size:
                 for k in list(self._span_cache.keys())[: self._cache_size // 4]:
                     self._span_cache.pop(k, None)
-            for j, idx in enumerate(miss_indices):
-                spans = batch_spans[j]
-                cached_spans[idx] = spans
-                h = hashlib.sha1(miss_texts[j].encode("utf-8", errors="replace")).hexdigest()
-                self._span_cache[h] = spans
+            for (ti, ci, ctext, is_volatile), spans in zip(miss_jobs, batch_spans):
+                chunk_spans[(ti, ci)] = spans
+                if not is_volatile:
+                    h = hashlib.sha1(ctext.encode("utf-8", errors="replace")).hexdigest()
+                    self._span_cache[h] = spans
 
-        # (3) Apply redactions back to each target.
-        for (text, setter), spans in zip(targets, cached_spans):
-            if not spans:
+        # (3) Combine chunk spans into target-relative spans, then apply.
+        for ti, (text, setter) in enumerate(targets):
+            all_spans: list[dict] = []
+            for ci, (_ctext, _is_vol, offset) in enumerate(per_target_chunks[ti]):
+                for sp in chunk_spans.get((ti, ci), ()):
+                    shifted = dict(sp)
+                    shifted["start"] += offset
+                    shifted["end"] += offset
+                    all_spans.append(shifted)
+            if not all_spans:
                 continue
-            redacted = self._apply_spans(text, spans)
+            redacted = self._apply_spans(text, all_spans)
             if redacted != text:
                 setter(redacted)
         return payload

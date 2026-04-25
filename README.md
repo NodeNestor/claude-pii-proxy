@@ -26,8 +26,13 @@ Claude Code  ──►  PII Proxy (:5599)  ──►  Anthropic API
 * PII detection: `openai/privacy-filter` (1.5B total / 50M active params,
   Apache-2.0). Runs locally via **onnxruntime** — no PyTorch.
 * Inference: defaults to int8 `model_quantized.onnx` on CPU, which is the
-  fastest variant for this MoE model (~54 ms / single, ~12 ms / string when
-  batched). All strings in a request are batched into a single forward pass.
+  fastest variant for this MoE model (~45 ms / single, ~6 ms / string when
+  batched). Strings are length-bucketed (power-of-two padded length) so a
+  single 2k-token system prompt doesn't drag short messages along with it.
+* Caching: stable parts of messages survive across conversation turns
+  even when Claude Code refreshes `<system-reminder>` timestamps each
+  request. After warmup, a 10-message conversation reduces from ~10 cache
+  misses per turn to ~1.
 * Override quantization with `PII_PROXY_QUANT` (e.g. `model_q4f16.onnx` for
   ~770 MB on disk vs 1.5 GB int8, at ~10× higher latency).
 * Override providers with `PII_PROXY_PROVIDERS=CUDAExecutionProvider,...`
@@ -88,6 +93,7 @@ All env vars can be set in `~/.claude/settings.json` under `env`:
 | `PII_PROXY_MODEL` | `openai/privacy-filter` | HF model id |
 | `PII_PROXY_QUANT` | `model_quantized.onnx` (int8) | Pin a specific ONNX variant — e.g. `model_q4f16.onnx` for smallest disk |
 | `PII_PROXY_PROVIDERS` | (auto) | Comma-separated ORT providers, e.g. `CUDAExecutionProvider,CPUExecutionProvider` |
+| `PII_PROXY_THREADS` | `min(8, cpu/2)` | ORT `intra_op_num_threads`. 8 is the sweet spot on most CPUs for this model |
 | `PII_PROXY_MIN_SCORE` | `0.5` | Minimum classifier confidence to redact |
 | `PII_PROXY_WARMUP` | `1` | Pre-load the model at startup |
 
