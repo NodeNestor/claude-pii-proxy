@@ -293,7 +293,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
             self.end_headers()
             while True:
-                chunk = resp.read(8192)
+                # read1: return whatever the socket has — read(8192) blocks
+                # until a full 8KB fills, which stutters chunked SSE streams.
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -461,7 +463,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         line_buf = b""
         try:
             while True:
-                chunk = resp.read(8192)
+                # read1, not read: SSE events must flow as they arrive.
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 line_buf += chunk
