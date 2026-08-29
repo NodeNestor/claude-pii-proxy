@@ -34,46 +34,16 @@ Write-Host "  Deps installed in $Venv"
 Write-Host "  (For NVIDIA GPUs install onnxruntime-gpu instead:"
 Write-Host "     $VenvPy -m pip uninstall -y onnxruntime; $VenvPy -m pip install onnxruntime-gpu)"
 
+# Wire into Claude Code via HTTPS_PROXY + NODE_EXTRA_CA_CERTS (NOT
+# ANTHROPIC_BASE_URL, which trips the Remote Control / GrowthBook gate).
 Write-Host "[3/4] Configuring Claude Code settings.json..."
 $SettingsFile = Join-Path $ClaudeDir "settings.json"
 if (-not (Test-Path $ClaudeDir)) {
     New-Item -ItemType Directory -Path $ClaudeDir -Force | Out-Null
 }
 try {
-    if (Test-Path $SettingsFile) {
-        $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
-    } else {
-        $settings = [PSCustomObject]@{}
-    }
-    if (-not ($settings | Get-Member -Name "env" -MemberType NoteProperty)) {
-        $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{})
-    }
-    $existing = $null
-    if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
-        $existing = $settings.env.ANTHROPIC_BASE_URL
-    }
-    if (-not $existing) {
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Write-Host "  Set ANTHROPIC_BASE_URL=$ProxyUrl"
-    } elseif ($existing -notmatch "127\.0\.0\.1.*$Port") {
-        $settings.env | Add-Member -NotePropertyName "PII_PROXY_UPSTREAM" -NotePropertyValue $existing -Force
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Write-Host "  Chaining: ANTHROPIC_BASE_URL=$ProxyUrl -> upstream=$existing"
-    } else {
-        Write-Host "  ANTHROPIC_BASE_URL already set"
-    }
-    $defaults = @{
-        "PII_PROXY_PORT"      = "5599"
-        "PII_PROXY_MIN_SCORE" = "0.5"
-        "PII_PROXY_MODEL"     = "openai/privacy-filter"
-        "PII_PROXY_WARMUP"    = "1"
-    }
-    foreach ($key in $defaults.Keys) {
-        if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
-            $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
-        }
-    }
-    $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+    $wireOut = & $VenvPy (Join-Path $ProxyDir "wire.py") --name pii-proxy --settings $SettingsFile 2>&1
+    foreach ($line in $wireOut) { Write-Host "  $line" }
     Write-Host "  Settings written to $SettingsFile"
 } catch {
     Write-Host "  ERROR: Could not update settings.json: $_"

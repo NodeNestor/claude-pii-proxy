@@ -34,44 +34,17 @@ echo "  Deps installed in $VENV_DIR"
 echo "  (For NVIDIA GPUs install onnxruntime-gpu instead:"
 echo "     $VPY -m pip uninstall -y onnxruntime && $VPY -m pip install onnxruntime-gpu)"
 
+# Wire into Claude Code via HTTPS_PROXY + NODE_EXTRA_CA_CERTS (NOT
+# ANTHROPIC_BASE_URL, which trips the Remote Control / GrowthBook gate).
 echo "[3/4] Configuring Claude Code settings.json..."
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 mkdir -p "$CLAUDE_DIR"
 
-"$PY" - "$SETTINGS_FILE" "$PROXY_URL" "$PORT" <<'PYEOF'
-import json, os, sys
-settings_file, proxy_url, port = sys.argv[1], sys.argv[2], sys.argv[3]
-settings = {}
-if os.path.exists(settings_file):
-    try:
-        with open(settings_file) as f:
-            settings = json.load(f)
-    except Exception:
-        settings = {}
-env = settings.setdefault("env", {})
-existing = env.get("ANTHROPIC_BASE_URL", "")
-if not existing:
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-    print(f"  Set ANTHROPIC_BASE_URL={proxy_url}")
-elif f"127.0.0.1:{port}" not in existing:
-    env["PII_PROXY_UPSTREAM"] = existing
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-    print(f"  Chaining: ANTHROPIC_BASE_URL={proxy_url} -> upstream={existing}")
-else:
-    print("  ANTHROPIC_BASE_URL already set")
-defaults = {
-    "PII_PROXY_PORT": "5599",
-    "PII_PROXY_MIN_SCORE": "0.5",
-    "PII_PROXY_MODEL": "openai/privacy-filter",
-    "PII_PROXY_WARMUP": "1",
-}
-for k, v in defaults.items():
-    env.setdefault(k, v)
-with open(settings_file, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-print(f"  Settings written to {settings_file}")
-PYEOF
+if ! "$VPY" "$PROXY_DIR/wire.py" --name pii-proxy --settings "$SETTINGS_FILE"; then
+    echo "  ERROR: could not update settings.json — left untouched."
+    exit 1
+fi
+echo "  Settings written to $SETTINGS_FILE"
 
 echo "[4/4] Registering Claude Code plugin..."
 PLUGIN_LINK="$CLAUDE_DIR/plugins/pii-proxy"

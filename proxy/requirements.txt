@@ -2,3 +2,6 @@ onnxruntime>=1.17.0
 tokenizers>=0.15.0
 huggingface_hub>=0.20.0
 numpy>=1.24.0
+# Generates the local CA for the HTTPS_PROXY MITM front-end (mitm_frontend.py).
+# The proxy runs from this venv, so the CA generator must be importable here.
+cryptography>=41.0.0

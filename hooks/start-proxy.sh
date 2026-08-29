@@ -31,7 +31,11 @@ if [ -f "$PLUGIN_JSON" ] && command -v python3 >/dev/null 2>&1; then
     CURRENT_VERSION=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version','unknown'))" "$PLUGIN_JSON" 2>/dev/null || echo "unknown")
 fi
 
-# Update settings.json
+# Wire ourselves into Claude Code via HTTPS_PROXY + NODE_EXTRA_CA_CERTS (NOT
+# ANTHROPIC_BASE_URL, which trips the Remote Control / GrowthBook gate). CA
+# generation, HTTPS_PROXY single-owner ownership, chaining with rolling-context,
+# plugin defaults and stale-base_url cleanup all live in wire.py — one tested
+# implementation shared with the PowerShell hook and rolling-context.
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 PY_CMD=""
 if command -v python3 >/dev/null 2>&1; then PY_CMD="python3"
@@ -39,35 +43,12 @@ elif command -v python >/dev/null 2>&1; then PY_CMD="python"
 fi
 
 if [ -n "$PY_CMD" ]; then
-    "$PY_CMD" - "$SETTINGS_FILE" "$PROXY_URL" "$PORT" <<'PYEOF' 2>>"$HOOK_LOG"
-import json, os, sys
-settings_file, proxy_url, port = sys.argv[1], sys.argv[2], sys.argv[3]
-settings = {}
-if os.path.exists(settings_file):
-    try:
-        with open(settings_file) as f:
-            settings = json.load(f)
-    except Exception:
-        settings = {}
-env = settings.setdefault("env", {})
-existing = env.get("ANTHROPIC_BASE_URL", "")
-if not existing:
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-elif f"127.0.0.1:{port}" not in existing:
-    env["PII_PROXY_UPSTREAM"] = existing
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-defaults = {
-    "PII_PROXY_PORT": "5599",
-    "PII_PROXY_MIN_SCORE": "0.5",
-    "PII_PROXY_MODEL": "openai/privacy-filter",
-    "PII_PROXY_WARMUP": "1",
-}
-for k, v in defaults.items():
-    env.setdefault(k, v)
-with open(settings_file, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-PYEOF
+    WIRE_OUT=$("$PY_CMD" "$PROXY_DIR/wire.py" --name pii-proxy --settings "$SETTINGS_FILE" 2>&1)
+    if [ $? -eq 0 ]; then
+        while IFS= read -r line; do [ -n "$line" ] && log "wire:$line"; done <<< "$WIRE_OUT"
+    else
+        log "WARNING: wire.py failed to update settings.json: $WIRE_OUT"
+    fi
 fi
 
 # Pick interpreter

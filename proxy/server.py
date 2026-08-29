@@ -40,6 +40,11 @@ log = logging.getLogger("pii-proxy")
 
 UPSTREAM_URL = os.environ.get("PII_PROXY_UPSTREAM") or "https://api.anthropic.com"
 LISTEN_PORT = int(os.environ.get("PII_PROXY_PORT") or "5599")
+# The MITM front-end port — Claude Code reaches us here via HTTPS_PROXY, which
+# (unlike ANTHROPIC_BASE_URL) keeps the destination api.anthropic.com and so
+# never trips Claude Code's Remote Control / GrowthBook gate. See mitm_frontend.
+MITM_PORT = int(os.environ.get("PII_PROXY_MITM_PORT") or "5601")
+CA_DIR = os.path.join(os.path.expanduser("~"), ".claude", "proxy-ca")
 WARMUP = os.environ.get("PII_PROXY_WARMUP", "1") not in ("0", "false", "False", "")
 MIN_SCORE = float(os.environ.get("PII_PROXY_MIN_SCORE", "0.5"))
 MODEL_ID = os.environ.get("PII_PROXY_MODEL", "openai/privacy-filter")
@@ -523,6 +528,35 @@ def main():
         except Exception as e:
             log.warning(f"[WARMUP] Failed (will load on first request): {e}")
     server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
+
+    # Start the MITM front-end. Claude Code connects to it via HTTPS_PROXY,
+    # believing it is talking to api.anthropic.com; the front-end terminates TLS
+    # (with a CA Claude Code trusts via NODE_EXTRA_CA_CERTS) and hands the
+    # decrypted, plaintext connection to our normal ProxyHandler — so every byte
+    # of redaction/streaming logic above is reused unchanged. Everything that is
+    # not api.anthropic.com is blind-tunnelled straight through.
+    try:
+        import mitm_frontend
+
+        def _on_terminated(tls_sock, addr, host):
+            server.RequestHandlerClass(tls_sock, addr, server)
+
+        # If the upstream is a custom gateway (not Anthropic, not a sibling on
+        # loopback), intercept that host too so Claude Code's traffic to it is
+        # still redacted.
+        _extra = []
+        _uh = (_parsed_upstream.hostname or "").lower()
+        if _uh and _uh not in ("127.0.0.1", "localhost", "::1") and not (
+            _uh == "api.anthropic.com" or _uh.endswith(".anthropic.com")
+        ):
+            _extra = [_uh]
+
+        mitm_frontend.start_in_thread(MITM_PORT, CA_DIR, _on_terminated, log=log.info, extra_hosts=_extra)
+        log.info(f"  MITM front-end: 127.0.0.1:{MITM_PORT} (HTTPS_PROXY entrypoint)"
+                 + (f", also intercepting {_extra[0]}" if _extra else ""))
+    except Exception as e:
+        log.warning(f"MITM front-end disabled ({e!r}); HTTPS_PROXY entrypoint unavailable")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

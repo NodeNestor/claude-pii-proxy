@@ -22,52 +22,18 @@ function Log($msg) {
 
 Log "Hook started. ProxyDir=$ProxyDir"
 
-# Always update settings.json first (even if proxy is already running)
+# Wire ourselves into Claude Code via HTTPS_PROXY + NODE_EXTRA_CA_CERTS (NOT
+# ANTHROPIC_BASE_URL, which trips the Remote Control / GrowthBook gate). CA
+# generation, HTTPS_PROXY single-owner ownership, chaining with rolling-context,
+# plugin defaults and stale-base_url cleanup all live in wire.py — one tested
+# implementation shared with the sh hook and rolling-context.
 $SettingsFile = Join-Path $ClaudeDir "settings.json"
+$WirePython = if (Test-Path $VenvPython) { $VenvPython } else { "python" }
 try {
-    if (Test-Path $SettingsFile) {
-        $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
-    } else {
-        $settings = [PSCustomObject]@{}
-    }
-
-    if (-not ($settings | Get-Member -Name "env" -MemberType NoteProperty)) {
-        $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{})
-    }
-
-    $existingUrl = $null
-    if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
-        $existingUrl = $settings.env.ANTHROPIC_BASE_URL
-    }
-
-    if (-not $existingUrl) {
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Log "Set ANTHROPIC_BASE_URL=$ProxyUrl (settings.json)"
-    } elseif ($existingUrl -notmatch "127\.0\.0\.1.*$Port") {
-        # Save existing URL as upstream so we chain transparently
-        $settings.env | Add-Member -NotePropertyName "PII_PROXY_UPSTREAM" -NotePropertyValue $existingUrl -Force
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Log "Chaining: upstream=$existingUrl"
-    } else {
-        Log "ANTHROPIC_BASE_URL already set to PII proxy"
-    }
-
-    # Plugin defaults
-    $defaults = @{
-        "PII_PROXY_PORT"      = "5599"
-        "PII_PROXY_MIN_SCORE" = "0.5"
-        "PII_PROXY_MODEL"     = "openai/privacy-filter"
-        "PII_PROXY_WARMUP"    = "1"
-    }
-    foreach ($key in $defaults.Keys) {
-        if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
-            $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
-        }
-    }
-
-    $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+    $wireOut = & $WirePython (Join-Path $ProxyDir "wire.py") --name pii-proxy --settings $SettingsFile 2>&1
+    foreach ($line in $wireOut) { Log "wire: $line" }
 } catch {
-    Log "WARNING: Could not update settings.json: $_"
+    Log "WARNING: wire.py failed to update settings.json: $_"
 }
 
 # Pick the python interpreter

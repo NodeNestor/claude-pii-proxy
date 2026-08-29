@@ -32,7 +32,7 @@ Restart your terminal and start a new Claude Code session. The `SessionStart`
 hook will:
 
 1. Create `proxy/.venv` and install `onnxruntime`, `tokenizers`, `huggingface_hub`, `numpy`.
-2. Set `ANTHROPIC_BASE_URL=http://127.0.0.1:5599` in `~/.claude/settings.json` (chains transparently if rolling-context or another proxy is already configured).
+2. Set `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` in `~/.claude/settings.json` — not `ANTHROPIC_BASE_URL`, which trips Claude Code's Remote Control / GrowthBook gate (chains transparently if rolling-context or another proxy is already configured).
 3. Start the proxy in the background.
 
 First request downloads ~1.5 GB of int8 ONNX weights from Hugging Face
@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 The installer:
 
 1. Creates `proxy/.venv` and installs `onnxruntime`, `tokenizers`, `huggingface_hub`, `numpy`.
-2. Sets `ANTHROPIC_BASE_URL=http://127.0.0.1:5599` in `~/.claude/settings.json` (chains transparently if another proxy was already configured).
+2. Sets `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` in `~/.claude/settings.json` — not `ANTHROPIC_BASE_URL`, which trips Claude Code's Remote Control / GrowthBook gate (chains transparently if another proxy was already configured).
 3. Symlinks the repo into `~/.claude/plugins/pii-proxy` so the `SessionStart` hook keeps the proxy alive.
 
 ### Switch to GPU inference
@@ -72,7 +72,7 @@ The command reinstalls onnxruntime in the proxy venv and writes
 ## How it works
 
 ```
-Claude Code  ──►  PII Proxy (:5599)  ──►  Anthropic API
+Claude Code  ──HTTPS_PROXY──►  PII Proxy MITM (:5601)  ──►  core (:5599)  ──►  Anthropic API
                        │  detect & redact text fields
                        │  persist real ↔ token map
                        │
